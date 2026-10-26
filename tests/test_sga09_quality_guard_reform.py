@@ -296,7 +296,9 @@ def test_unknown_repository_is_inconclusive_never_approved(tmp_path: Path):
     assert response["verdict_state"] == VerdictState.INCONCLUSIVE.value
     assert response["evidence_executed"] is False
     assert response["layers_executed"] == []
-    assert set(response["layers_skipped"]) == set(_ALL_LAYERS)
+    # TICKET-SGA-11 F3: camadas não aplicáveis não são omissões de cobertura.
+    assert response["layers_skipped"] == []
+    assert set(response["layers_not_applicable"]) == set(_ALL_LAYERS)
     assert all(state == "not_applicable" for state in response["layer_status"].values())
     assert response["inconclusive_reasons"]
     _assert_verdict_precedence(response)
@@ -330,7 +332,7 @@ def test_missing_toolchain_is_inconclusive_and_does_not_fake_execution(tmp_path:
 
 
 def test_circuit_breaker_emergency_release_is_the_only_no_evidence_pass(tmp_path: Path):
-    """EMERGENCY_RELEASE é o único passed=True sem evidência, e declara cobertura."""
+    """TICKET-SGA-11 F4: circuit breaker NUNCA aprova sem evidência executada."""
     _python_clean_workspace(tmp_path)
     from agent_quality_guard.core.score_gate import history_set
 
@@ -338,14 +340,15 @@ def test_circuit_breaker_emergency_release_is_the_only_no_evidence_pass(tmp_path
 
     response = asyncio.run(_quality_guard_core(workspace=str(tmp_path)))
 
-    assert response["passed"] is True
+    assert response["passed"] is False
     assert response["status"] == "EMERGENCY_RELEASE"
-    assert response["verdict_state"] == VerdictState.EMERGENCY_RELEASE.value
-    assert response["approved_with_caveat"] is True
+    assert response["verdict_state"] == VerdictState.INCONCLUSIVE.value
+    assert response["approved_with_caveat"] is False
     assert response["evidence_executed"] is False
     assert response["layers_executed"] == []
     assert set(response["layers_skipped"]) == set(_ALL_LAYERS)
     assert all(state == "emergency_release" for state in response["layer_status"].values())
+    assert "Laudo de Inviabilidade" in response["message"]
     _assert_verdict_precedence(response)
 
 

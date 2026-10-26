@@ -34,7 +34,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger("agent_quality_guard.multi_stack")
 
@@ -518,6 +518,126 @@ class MultiStackRunner:
         lowered = output.lower()
         return any(marker in lowered for marker in markers)
 
+    # ── Atribuição real de falhas (TICKET-SGA-11 F1) ──────────────────────
+    _FAILED_TEST_PATTERNS = (
+        # Bun:  "(fail) nome do teste [0.12ms]"
+        re.compile(r"^\s*\(fail\)\s+(?P<name>.+?)(?:\s+\[\d+(?:\.\d+)?m?s\])?\s*$", re.MULTILINE),
+        # node --test / TAP:  "not ok 3 - nome do teste"
+        re.compile(r"^not ok\s+\d+\s*-\s*(?P<name>.+?)\s*$", re.MULTILINE),
+        # reporter spec (node >= 20):  "✖ nome do teste"
+        re.compile(r"^\s*✖\s+(?P<name>.+?)\s*$", re.MULTILINE),
+        # pytest:  "FAILED tests/test_x.py::test_y - AssertionError..."
+        re.compile(r"^FAILED\s+(?P<name>\S+)(?:\s+-\s+.*)?$", re.MULTILINE),
+        # cargo test:  "test nome ... FAILED"
+        re.compile(r"^test\s+(?P<name>\S+)\s+\.\.\.\s+FAILED", re.MULTILINE),
+        # go test:  "--- FAIL: TestName (0.00s)"
+        re.compile(r"^--- FAIL:\s+(?P<name>\S+)", re.MULTILINE),
+        # dart test:  "[E] nome do teste"
+        re.compile(r"^\s*\[E\]\s+(?P<name>.+?)\s*$", re.MULTILINE),
+    )
+
+    _ASSERTION_MARKERS = (
+        "assertionerror", "expected", "received", "expected:", "received:",
+        "error:", "panic:", "error [",
+    )
+
+    @classmethod
+    def _extract_failed_test_names(cls, output: str) -> List[str]:
+        """Extrai nomes reais de testes que falharam da saída do runner.
+
+        Sem heurística inventada: apenas padrões canônicos emitidos por Bun,
+        ``node --test`` (TAP/spec), pytest, cargo, go e dart. Ordem preservada
+        e duplicatas removidas.
+
+        Exemplo:
+            >>> MultiStackRunner._extract_failed_test_names("(fail) soma [0.1ms]")
+            ['soma']
+        """
+        names: List[str] = []
+        seen: set = set()
+        for pattern in cls._FAILED_TEST_PATTERNS:
+            for match in pattern.finditer(output or ""):
+                name = match.group("name").strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                names.append(name)
+        return names
+
+    @classmethod
+    def _extract_assertion_evidence(cls, output: str, limit: int = 2) -> List[str]:
+        """Coleta as primeiras linhas de asserção/erro real (não o ruído final).
+
+        Exemplo:
+            >>> MultiStackRunner._extract_assertion_evidence("AssertionError: 1 != 2")
+            ['AssertionError: 1 != 2']
+        """
+        evidence: List[str] = []
+        for line in (output or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lowered = stripped.lower()
+            if any(marker in lowered for marker in cls._ASSERTION_MARKERS):
+                evidence.append(stripped[:300])
+                if len(evidence) >= limit:
+                    break
+        return evidence
+
+    @classmethod
+    def _failure_details_for(
+        cls, output: str, runner: Optional[str], raw_tail: int = 500,
+    ) -> List[str]:
+        """Monta ``failure_details`` atribuído: lista de testes + asserção + anexo bruto.
+
+        O trecho bruto deixa de ser o diagnóstico principal (TICKET-SGA-11 F1):
+        ele permanece apenas como anexo final, precedido dos testes que falharam
+        e da evidência de asserção.
+
+        Exemplo:
+            >>> details = MultiStackRunner._failure_details_for("(fail) soma\\nassert 1==2", "bun")
+            >>> details[0].startswith("Testes com falha:")
+            True
+        """
+        if not (output or "").strip():
+            return []
+        details: List[str] = []
+        names = cls._extract_failed_test_names(output)
+        if names:
+            listed = names[:3]
+            extra = len(names) - len(listed)
+            header = "Testes com falha: " + "; ".join(listed)
+            if extra > 0:
+                header += f" (+{extra} outro(s))"
+            details.append(header)
+        else:
+            details.append(
+                f"Runner {runner or 'desconhecido'}: falha sem nome de teste identificável na saída"
+            )
+        details.extend(cls._extract_assertion_evidence(output))
+        tail = (output or "")[-max(raw_tail, 0):] if raw_tail else ""
+        if tail.strip():
+            details.append("Trecho bruto da saída (anexo):\n" + tail)
+        return details
+
+    @classmethod
+    def _summary_with_failures(cls, base_summary: str, output: str) -> str:
+        """Anexa até 3 nomes de testes falhos ao resumo (TICKET-SGA-11 F1).
+
+        Exemplo:
+            >>> MultiStackRunner._summary_with_failures("bun: 1 falha", "(fail) soma")
+            'bun: 1 falha | testes com falha: soma'
+        """
+        names = cls._extract_failed_test_names(output)
+        if not names:
+            return base_summary
+        listed = names[:3]
+        extra = len(names) - len(listed)
+        suffix = ", ".join(listed)
+        if extra > 0:
+            suffix += f" (+{extra})"
+        return f"{base_summary} | testes com falha: {suffix}"
+
     @classmethod
     def run_tests(cls, workspace_path: Path, stack: str, tmp_dir: Path) -> Dict[str, Any]:
         """Executa a suíte real da stack detectada com TMPDIR isolado e teto de 600s.
@@ -601,10 +721,11 @@ class MultiStackRunner:
         failed_match = re.search(r"Tests:.*?(\d+)\s+failed", output)
         total_failed = int(failed_match.group(1)) if failed_match else (0 if passed else 1)
         evidence = bool(match or cls._output_has_test_evidence(output))
+        base_summary = f"Jest React Native: {total_passed} testes aprovados em {round(time.time() - start, 2)}s"
         return cls._build_test_result(
             passed=passed, total_passed=total_passed, total_failed=total_failed,
-            summary=f"Jest React Native: {total_passed} testes aprovados em {round(time.time() - start, 2)}s",
-            failure_details=[] if passed else [output[-500:]],
+            summary=base_summary if passed else cls._summary_with_failures(base_summary, output),
+            failure_details=[] if passed else cls._failure_details_for(output, "jest"),
             start=start, evidence=evidence, runner="jest",
             verdict_state=None if evidence else VERDICT_INCONCLUSIVE,
             reason=None if evidence else "saida_sem_contagem",
@@ -647,10 +768,11 @@ class MultiStackRunner:
         total_passed = int(passed_match.group(1)) if passed_match else 0
         total_failed = int(failed_match.group(1)) if failed_match else (0 if passed else 1)
         evidence = bool(passed_match or failed_match)
+        base_summary = f"pytest real: {total_passed} aprovados, {total_failed} falhas"
         return cls._build_test_result(
             passed=passed, total_passed=total_passed, total_failed=total_failed,
-            summary=f"pytest real: {total_passed} aprovados, {total_failed} falhas",
-            failure_details=[] if passed else [output[-500:]],
+            summary=base_summary if passed else cls._summary_with_failures(base_summary, output),
+            failure_details=[] if passed else cls._failure_details_for(output, "pytest"),
             start=start, evidence=evidence, runner="pytest",
             verdict_state=None if evidence else VERDICT_INCONCLUSIVE,
             reason=None if evidence else "saida_sem_contagem",
@@ -709,8 +831,13 @@ class MultiStackRunner:
         return cls._build_test_result(
             passed=passed, total_passed=passed_total,
             total_failed=failed_total if failed_total else (0 if passed else 1),
-            summary=f"cargo test: {passed_total} aprovados, {failed_total} falhas",
-            failure_details=[] if passed else [output[-500:]],
+            summary=(
+                f"cargo test: {passed_total} aprovados, {failed_total} falhas"
+                if passed else cls._summary_with_failures(
+                    f"cargo test: {passed_total} aprovados, {failed_total} falhas", output
+                )
+            ),
+            failure_details=[] if passed else cls._failure_details_for(output, "cargo"),
             start=start, evidence=evidence, runner="cargo",
             verdict_state=None if evidence else VERDICT_INCONCLUSIVE,
             reason=None if evidence else "saida_sem_contagem",
@@ -742,18 +869,30 @@ class MultiStackRunner:
             timeout=_TEST_COMMAND_TIMEOUT_SECONDS,
         )
         output = proc.stdout + "\n" + proc.stderr
-        passed = proc.returncode == 0
         ok_packages = len(re.findall(r"^ok\s+", output, re.MULTILINE))
         failed_packages = len(re.findall(r"^(?:FAIL|--- FAIL)", output, re.MULTILINE))
+        tests_ran = ok_packages > 0
+        # TICKET-SGA-10: "no test files" NÃO é evidência de suíte aprovada.
+        # Sem ao menos um pacote `ok` não há como emitir VERIFIED_PASS.
+        passed = proc.returncode == 0 and ok_packages > 0 and failed_packages == 0
         evidence = bool(ok_packages or failed_packages or "no test files" in output)
+        base_summary = f"go test: {ok_packages} pacotes ok, {failed_packages} falhas"
+        if not tests_ran:
+            verdict_state = VERDICT_VERIFIED_FAIL if failed_packages else VERDICT_INCONCLUSIVE
+            reason = "go_sem_pacotes_ok" if not failed_packages else "go_testes_falharam"
+            if "no test files" in output and not failed_packages:
+                base_summary += " (nenhum arquivo *_test.go executado)"
+        else:
+            verdict_state = None if evidence else VERDICT_INCONCLUSIVE
+            reason = None if evidence else "saida_sem_contagem"
         return cls._build_test_result(
             passed=passed, total_passed=ok_packages,
             total_failed=failed_packages if failed_packages else (0 if passed else 1),
-            summary=f"go test: {ok_packages} pacotes ok, {failed_packages} falhas",
-            failure_details=[] if passed else [output[-500:]],
+            summary=base_summary if passed else cls._summary_with_failures(base_summary, output),
+            failure_details=[] if passed else cls._failure_details_for(output, "go"),
             start=start, evidence=evidence, runner="go",
-            verdict_state=None if evidence else VERDICT_INCONCLUSIVE,
-            reason=None if evidence else "saida_sem_contagem",
+            verdict_state=verdict_state,
+            reason=reason,
         )
 
     @classmethod
@@ -790,10 +929,11 @@ class MultiStackRunner:
         total_passed = int(passed_match.group(1)) if passed_match else 0
         total_failed = int(failed_match.group(1)) if failed_match else (0 if passed else 1)
         evidence = bool(passed_match or failed_match or cls._output_has_test_evidence(output))
+        base_summary = f"Dart/Flutter test: {total_passed} aprovados, {total_failed} falhas"
         return cls._build_test_result(
             passed=passed, total_passed=total_passed, total_failed=total_failed,
-            summary=f"Dart/Flutter test: {total_passed} aprovados, {total_failed} falhas",
-            failure_details=[] if passed else [output[-500:]],
+            summary=base_summary if passed else cls._summary_with_failures(base_summary, output),
+            failure_details=[] if passed else cls._failure_details_for(output, Path(cmd[0]).name),
             start=start, evidence=evidence, runner=Path(cmd[0]).name,
             verdict_state=None if evidence else VERDICT_INCONCLUSIVE,
             reason=None if evidence else "saida_sem_contagem",
@@ -1001,11 +1141,13 @@ class MultiStackRunner:
                 runner=label, reason="saida_sem_contagem",
             )
         tot_passed, tot_failed = parsed
+        base_summary = f"Node/TS/Bun Tests ({label}): {tot_passed} aprovados, {tot_failed} falhas"
         return cls._build_test_result(
             passed=passed, total_passed=tot_passed, total_failed=tot_failed,
-            summary=f"Node/TS/Bun Tests ({label}): {tot_passed} aprovados, {tot_failed} falhas",
-            failure_details=[] if passed else [output[-500:]],
+            summary=base_summary if passed else cls._summary_with_failures(base_summary, output),
+            failure_details=[] if passed else cls._failure_details_for(output, label),
             start=start, evidence=True, runner=label,
+            reason=None if passed else "testes_falharam",
         )
 
     @classmethod
@@ -1126,10 +1268,20 @@ class MultiStackRunner:
     ) -> Optional[Dict[str, Any]]:
         """Executa analisador semântico de AST JS via Node.js."""
         js_guard_script = Path(__file__).resolve().parent.parent / "memory" / "js_ast_guard.js"
-        default_node = str(Path.home() / ".local" / "node" / "bin" / "node")
-        node_bin = shutil.which("node") or default_node
+        # Fallbacks explícitos de Linux e macOS (Homebrew Intel/Apple Silicon):
+        # ``which`` é a fonte primária, nunca a única.
+        node_candidates = (
+            shutil.which("node"),
+            str(Path.home() / ".local" / "node" / "bin" / "node"),
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+        )
+        node_bin = next(
+            (candidate for candidate in node_candidates if candidate and Path(candidate).exists()),
+            None,
+        )
 
-        if not (Path(node_bin).exists() and js_guard_script.exists()):
+        if not node_bin or not js_guard_script.exists():
             return None
 
         cmd = [str(node_bin), str(js_guard_script)]
@@ -1159,11 +1311,9 @@ class MultiStackRunner:
 
         for item in ast_data.get("violations", []):
             rel = item["file_path"]
-            try:
-                if Path(rel).is_absolute():
-                    rel = str(Path(rel).relative_to(workspace_path))
-            except ValueError as rel_err:
-                logger.debug(f"Caminho já é relativo ao workspace ({rel}): {rel_err}")
+            if Path(rel).is_absolute():
+                # Symlinks do macOS (/var -> /private/var): relativização simétrica.
+                rel = cls._workspace_relative(workspace_path, rel)
             v = MultiStackViolation(
                 rule_id=item["rule_id"],
                 category=item["category"],
@@ -1265,7 +1415,7 @@ class MultiStackRunner:
         warnings: List[MultiStackViolation]
     ) -> bool:
         """Lê e varre as linhas de um único arquivo de código."""
-        rel = str(fpath.relative_to(workspace_path))
+        rel = cls._workspace_relative(workspace_path, fpath)
         try:
             content = fpath.read_text(encoding="utf-8", errors="ignore")
         except Exception as read_err:
@@ -1603,7 +1753,9 @@ class MultiStackRunner:
                 detail="tsconfig.json presente, binário tsc ausente (node_modules/.bin ou PATH)",
             ))
 
-        relative_files = [str(f.relative_to(workspace_path)) for f in files if f.is_file()]
+        relative_files = [
+            cls._workspace_relative(workspace_path, f) for f in files if f.is_file()
+        ]
         if not relative_files:
             return
 
@@ -1680,7 +1832,9 @@ class MultiStackRunner:
         Exemplo:
             >>> MultiStackRunner._bridge_python_toolchain(Path("."), [], {}, time.monotonic(), [], [], [])
         """
-        relative_files = [str(f.relative_to(workspace_path)) for f in files if f.is_file()]
+        relative_files = [
+            cls._workspace_relative(workspace_path, f) for f in files if f.is_file()
+        ]
         if not relative_files:
             return
 
@@ -1990,6 +2144,26 @@ class MultiStackRunner:
         except Exception as bridge_err:
             logger.debug("Camada 1 indisponível para %s: %s", workspace_path, bridge_err)
             return None
+
+    @staticmethod
+    def _workspace_relative(workspace_path: Path, file_path: Union[str, Path]) -> str:
+        """Normaliza um arquivo para caminho relativo ao workspace de forma segura.
+
+        Resolve symlinks DOS DOIS LADOS antes de relativizar: no macOS
+        ``/var/folders`` é symlink para ``/private/var/folders`` e a comparação
+        ingênua levanta ``ValueError`` (causa da falha da native_bridge em
+        ``macos-latest`` — TICKET-SGA-10). Nunca propaga exceção: cai para o
+        nome do arquivo.
+
+        Exemplo:
+            >>> MultiStackRunner._workspace_relative(Path("/tmp"), "/tmp/a.py")
+            'a.py'
+        """
+        candidate = Path(file_path)
+        try:
+            return str(candidate.resolve().relative_to(Path(workspace_path).resolve()))
+        except (OSError, ValueError):
+            return candidate.name
 
     @staticmethod
     def _absolute_native_path(workspace_path: Path, raw_path: str) -> Path:
@@ -2635,8 +2809,16 @@ class MultiStackRunner:
             layer_status = "inconclusive"
             skip_reason = f"{len(failed_files)} arquivo(s) falharam na Camada 4 (Tree-Sitter)"
         elif parsed_files == 0:
-            layer_status = "inconclusive"
-            skip_reason = "nenhuma gramática Tree-Sitter disponível (fallback lexical)"
+            # TICKET-SGA-10 (item 5): sem gramática instalada o fallback lexical
+            # determinístico executou sobre TODOS os arquivos elegíveis. Isso é
+            # cobertura degradada — declarada em ``skip_reasons``/engine —, não
+            # ausência de evidência. O contrato do job CI sem tree-sitter exige
+            # que a Camada 4 não reprove a entrega só por falta do pacote opcional.
+            layer_status = "executed"
+            skip_reason = (
+                "nenhuma gramática Tree-Sitter disponível; fallback lexical "
+                "determinístico executado sobre todos os arquivos elegíveis"
+            )
         else:
             layer_status = "executed"
             skip_reason = ""
@@ -2647,9 +2829,13 @@ class MultiStackRunner:
             "total_files": len(source_files),
             "engine": engine,
             "layer_status": layer_status,
+            "degraded": engine.endswith("lexical_fallback") and layer_status == "executed",
             "layers_executed": ["layer4_tree_sitter"] if layer_status == "executed" else [],
             "layers_skipped": [] if layer_status == "executed" else ["layer4_tree_sitter"],
-            "skip_reasons": {} if not skip_reason else {"layer4_tree_sitter": skip_reason},
+            "skip_reasons": (
+                {"layer4_tree_sitter": skip_reason} if skip_reason and layer_status != "executed"
+                else ({"grammar_unavailable": skip_reason} if skip_reason else {})
+            ),
             "inconclusive_reasons": [] if layer_status in ("executed", "not_applicable") else [skip_reason],
             "failed_files": failed_files,
         }
@@ -2669,6 +2855,25 @@ class MultiStackRunner:
                 exc,
             )
         return str(file_path)
+
+    @staticmethod
+    def _count_source_lines(source_files: List[Path]) -> int:
+        """Conta as linhas realmente lidas dos arquivos elegíveis (medida real).
+
+        TICKET-SGA-11 F5: ``total_lines_scanned`` deixa de ser zero literal no
+        caminho JS — é a soma das linhas dos arquivos efetivamente coletados.
+
+        Exemplo:
+            >>> MultiStackRunner._count_source_lines([])
+            0
+        """
+        total = 0
+        for fpath in source_files:
+            try:
+                total += len(fpath.read_text(encoding="utf-8", errors="ignore").splitlines())
+            except OSError as read_err:
+                logger.debug("Linhas indisponíveis para %s: %s", fpath, read_err)
+        return total
 
     @classmethod
     def _collect_js_source_files(cls, workspace_path: Path, stack: str) -> List[Path]:
@@ -2695,7 +2900,7 @@ class MultiStackRunner:
             f
             for f in files
             if not any(
-                x in str(f.relative_to(workspace_path))
+                x in cls._workspace_relative(workspace_path, f)
                 for x in ("node_modules", "__tests__", "tests", "__mocks__", "coverage", ".git", ".expo", "dist", "build")
             )
         ]
@@ -2754,7 +2959,7 @@ class MultiStackRunner:
             >>> "blocking" in res and "layers_executed" in res
             True
         """
-        workspace_path = Path(workspace_path)
+        workspace_path = Path(workspace_path).resolve()
         blocking: List[MultiStackViolation] = []
         warnings: List[MultiStackViolation] = []
 
@@ -2778,6 +2983,8 @@ class MultiStackRunner:
                 "layer_status": {layer: "not_applicable" for layer in skipped},
                 "critical_failures": [],
                 "inconclusive_reasons": [],
+                "tree_sitter_scan": None,
+                "total_lines": 0,
             }
 
         node_res = cls._run_node_js_ast(workspace_path, source_files, stack, blocking, warnings)
@@ -2808,7 +3015,9 @@ class MultiStackRunner:
         for tool_name, reason in (merged_result.get("native_skipped_tools") or {}).items():
             skip_reasons[f"tool:{tool_name}"] = str(reason)
 
-        # Camada 4: meta-regras universais via Tree-Sitter.
+        # Camada 4: meta-regras universais via Tree-Sitter (executada UMA vez;
+        # o resultado bruto é embutido em ``tree_sitter_scan`` para o orquestrador
+        # reaproveitar sem reexecutar o TreeSitterGuard — TICKET-SGA-10 item 1).
         try:
             ts_result = cls.scan_tree_sitter(
                 workspace_path, stack, audit_mode, source_files=source_files
@@ -2829,10 +3038,17 @@ class MultiStackRunner:
                         f"Camada 4 terminou com status={ts_state}",
                     )
                 )
+            # Fallback lexical determinístico (sem gramática instalada): declara
+            # a cobertura degradada sem transformá-la em omissão de camada.
+            for reason_key, reason_value in (ts_result.get("skip_reasons") or {}).items():
+                if reason_key != "layer4_tree_sitter":
+                    skip_reasons[reason_key] = str(reason_value)
         else:
             layers_skipped.append("layer4_tree_sitter")
             skip_reasons["layer4_tree_sitter"] = "TreeSitterGuard indisponível para a stack"
 
+        merged_result["tree_sitter_scan"] = ts_result
+        merged_result["total_lines"] = cls._count_source_lines(source_files)
         merged_result["layers_executed"] = layers_executed
         merged_result["layers_skipped"] = layers_skipped
         merged_result["skip_reasons"] = skip_reasons

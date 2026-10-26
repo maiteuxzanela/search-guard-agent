@@ -134,20 +134,24 @@ async def test_needle_verify_delivery_circuit_breaker_emergency_release():
             assert resp["approved_with_caveat"] is False
 
         resp = await needle_verify_delivery(workspace=tmp_dir)
-        assert resp["passed"] is True
+        # TICKET-SGA-11 F4: sem evidência executada, o circuito terminal NÃO aprova.
+        assert resp["passed"] is False
         assert resp["status"] == "EMERGENCY_RELEASE"
         assert resp["attempt_number"] == 5
         assert resp["pytest_success"] is False, (
             "Saída de Emergência não executa pytest e não pode reportá-lo como sucesso"
         )
         assert resp["pytest_chunks"] == []
-        assert resp["approved_with_caveat"] is True
+        assert resp["approved_with_caveat"] is False
+        assert resp["evidence_executed"] is False
         assert "STATUS TERMINAL" in resp["message"]
+        assert "Laudo de Inviabilidade" in resp["message"]
 
-        # Chamada repetida no mesmo estado mantém liberação com status terminal
+        # Chamada repetida no mesmo estado mantém o status terminal sem aprovar
         resp_repeat = await needle_verify_delivery(workspace=tmp_dir)
         assert resp_repeat["status"] == "EMERGENCY_RELEASE"
         assert resp_repeat["attempt_number"] == 5
+        assert resp_repeat["passed"] is False
         assert "STATUS TERMINAL" in resp_repeat["message"]
         assert "NÃO re-execute needle_verify_delivery" in resp_repeat["message"]
 

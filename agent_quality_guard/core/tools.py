@@ -120,7 +120,19 @@ _QUALITY_GUARD_PARAMETERS: Dict[str, Any] = {
         "audit_mode": {
             "type": "string",
             "default": "delta",
-            "description": "Modo de auditoria do workspace ('delta' ou 'full').",
+            "description": (
+                "Modo de auditoria do workspace ('delta' ou 'full'). O valor "
+                "'static_diagnostic' ativa o diagnóstico estático."
+            ),
+        },
+        "static_diagnostic": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Executa as camadas estáticas mesmo com a Camada 0 (testes) reprovada, "
+                "para diagnóstico. NUNCA aprova: o veredito herda o estado não-aprovador "
+                "da Camada 0 (ou INCONCLUSIVE se ferramenta crítica falhar)."
+            ),
         },
     },
 }
@@ -133,7 +145,8 @@ _QUALITY_GUARD_DESCRIPTION = (
     "ruff/mypy, clippy, go vet), 4º meta-regras universais de AST via Tree-Sitter "
     "(floating promises, silent catch, resource leaks). "
     "Circuit breaker universal de 5 tentativas: na 5ª tentativa sem aprovação "
-    "determinística, o código é liberado com ressalva (EMERGENCY_RELEASE)."
+    "determinística, emite Laudo de Inviabilidade Técnica — nunca aprova sem "
+    "evidência executada (passed=false)."
 )
 
 _NEEDLE_VERIFY_DELIVERY_DESCRIPTION = (
@@ -145,7 +158,8 @@ _NEEDLE_VERIFY_DELIVERY_DESCRIPTION = (
     "3º Camada 1 (compiladores/linters nativos) e "
     "4º Camada 2 (meta-regras universais de AST via Tree-Sitter). "
     "Circuit breaker universal de 5 tentativas: se a 5ª tentativa for atingida "
-    "sem aprovação determinística, o código é aprovado com ressalva (EMERGENCY_RELEASE)."
+    "sem aprovação determinística, emite Laudo de Inviabilidade (nunca passed=true "
+    "sem evidência executada)."
 )
 
 

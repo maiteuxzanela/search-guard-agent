@@ -516,15 +516,19 @@ _QUALITY_GUARD_DESCRIPTION = (
     "3º bridge nativa de compiladores/linters do projeto (tsc, eslint/biome, ruff/mypy, clippy, go vet; timeout 600s); "
     "4º meta-regras universais de AST via Tree-Sitter (floating promises, silent catch, leaks). "
     "Veredito explícito: VERIFIED_PASS, VERIFIED_FAIL, NOT_APPLICABLE, INCONCLUSIVE ou EMERGENCY_RELEASE; "
-    "nenhuma aprovação sem evidência real executada. Cobertura exposta em layers_executed/layers_skipped/skip_reasons. "
-    "Circuit breaker universal de 5 tentativas: atinge a Saída de Emergência na 5ª tentativa (EMERGENCY_RELEASE)."
+    "nenhuma aprovação sem evidência real executada. Cobertura exposta em layers_executed/layers_skipped/"
+    "layers_not_applicable/skip_reasons. static_diagnostic=true executa as camadas estáticas mesmo com "
+    "testes vermelhos, sem nunca aprovar. "
+    "Circuit breaker universal de 5 tentativas: na 5ª tentativa sem aprovação emite Laudo de "
+    "Inviabilidade Técnica (EMERGENCY_RELEASE com passed=false; nunca aprova sem evidência)."
 )
 
 _LEGACY_ALIAS_DESCRIPTION = (
     "Alias legado de agent_quality_guard (MESMA implementação e assinatura). "
     "Mantido para compatibilidade retroativa total com clientes antigos. "
     "Pipeline 100% determinístico, sem Laya/Noul no caminho crítico. "
-    "Circuit breaker universal de 5 tentativas com Saída de Emergência (EMERGENCY_RELEASE)."
+    "Circuit breaker universal de 5 tentativas com Laudo de Inviabilidade (EMERGENCY_RELEASE, "
+    "nunca passed=true sem evidência executada)."
 )
 
 # Stacks cujo runner multi-stack executa a suíte real de testes.
@@ -572,24 +576,23 @@ def _layer_coverage(
     skip_reasons: Optional[Dict[str, str]] = None,
     default_skip_reason: str = "não executada",
 ) -> Dict[str, Any]:
-    """Monta cobertura explícita de camadas (executadas, puladas e motivos).
+    """Monta cobertura explícita de camadas (executadas, puladas e não aplicáveis).
 
-    Nenhuma camada ausente fica implícita: toda camada fora de ``executed``
-    aparece em ``layers_skipped`` com motivo em ``skip_reasons``.
+    TICKET-SGA-11 F3: camadas com status ``not_applicable`` saem de
+    ``layers_skipped`` e vão para ``layers_not_applicable`` — deixam de simular
+    omissão de cobertura (uma stack JS não tem "camadas puladas" por ser JS).
+    Nenhuma camada fica implícita: as realmente omitidas seguem em
+    ``layers_skipped`` com motivo em ``skip_reasons``.
 
     Exemplo:
         >>> cov = _layer_coverage([LAYER_TESTS])
         >>> LAYER_AST_GUARD in cov["layers_skipped"]
         True
+        >>> cov_js = _layer_coverage([LAYER_TESTS], statuses={LAYER_AST_GUARD: "not_applicable"})
+        >>> cov_js["layers_not_applicable"]
+        ['layer1_ast_guard']
     """
     executed_set = {layer for layer in executed if layer in _ALL_LAYERS}
-    ordered_executed = [layer for layer in _ALL_LAYERS if layer in executed_set]
-    ordered_skipped = [layer for layer in _ALL_LAYERS if layer not in executed_set]
-    reasons = dict(skip_reasons or {})
-    for layer in ordered_skipped:
-        reasons.setdefault(layer, default_skip_reason)
-    for layer in ordered_executed:
-        reasons.pop(layer, None)
     status_map = {
         layer: ("executed" if layer in executed_set else "not_executed")
         for layer in _ALL_LAYERS
@@ -597,10 +600,31 @@ def _layer_coverage(
     for layer, state in (statuses or {}).items():
         if layer in _ALL_LAYERS:
             status_map[layer] = state
+    ordered_executed = [layer for layer in _ALL_LAYERS if layer in executed_set]
+    ordered_not_applicable = [
+        layer for layer in _ALL_LAYERS
+        if layer not in executed_set and status_map.get(layer) == "not_applicable"
+    ]
+    ordered_skipped = [
+        layer for layer in _ALL_LAYERS
+        if layer not in executed_set and layer not in ordered_not_applicable
+    ]
+    reasons = dict(skip_reasons or {})
+    not_applicable_reasons: Dict[str, str] = {}
+    for layer in ordered_not_applicable:
+        declared = reasons.pop(layer, None)
+        if declared:
+            not_applicable_reasons[layer] = declared
+    for layer in ordered_skipped:
+        reasons.setdefault(layer, default_skip_reason)
+    for layer in ordered_executed:
+        reasons.pop(layer, None)
     return {
         "layers_executed": ordered_executed,
         "layers_skipped": ordered_skipped,
+        "layers_not_applicable": ordered_not_applicable,
         "skip_reasons": reasons,
+        "not_applicable_reasons": not_applicable_reasons,
         "layer_status": status_map,
     }
 
@@ -747,6 +771,28 @@ def _run_layer2_meta_rules(target_path: Path, audit_mode: str) -> Dict[str, Any]
             status = str(res.get("layer_status") or "executed")
             executed = list(res.get("layers_executed") or [])
             skipped = list(res.get("layers_skipped") or [])
+            engine = str(res.get("engine") or "tree_sitter")
+            inconclusive = [str(reason) for reason in (res.get("inconclusive_reasons") or [])]
+            files_scanned = int(res.get("files_scanned", 0) or 0)
+            # TICKET-SGA-10 item 5: sem o pacote opcional tree-sitter o fallback
+            # lexical determinístico cobre TODOS os arquivos elegíveis. Isso é
+            # cobertura degradada declarada (engine + grammar_unavailable), não
+            # ausência de evidência: não pode reprovar um workspace limpo no job
+            # de resiliência do CI. Arquivos ilegíveis/excedidos continuam
+            # tornando a camada genuinamente inconclusiva.
+            degraded_lexical = (
+                status == "inconclusive"
+                and engine == "tree_sitter_lexical_fallback"
+                and files_scanned > 0
+                and len(inconclusive) <= 1
+                and all(
+                    "gramática" in reason or "fallback lexical" in reason
+                    for reason in inconclusive
+                )
+            )
+            if degraded_lexical:
+                status = "executed"
+                inconclusive = []
             if status == "executed" and LAYER_TREE_SITTER not in executed:
                 executed = [LAYER_TREE_SITTER]
             if status != "executed" and LAYER_TREE_SITTER not in skipped:
@@ -760,11 +806,12 @@ def _run_layer2_meta_rules(target_path: Path, audit_mode: str) -> Dict[str, Any]
                 "layers_executed": executed,
                 "layers_skipped": skipped,
                 "skip_reasons": dict(res.get("skip_reasons") or {}),
-                "inconclusive_reasons": list(res.get("inconclusive_reasons") or []),
-                "engine": str(res.get("engine") or "tree_sitter"),
+                "inconclusive_reasons": inconclusive,
+                "engine": engine,
+                "degraded": bool(res.get("degraded") or degraded_lexical),
                 "languages": list(res.get("languages") or []),
                 "languages_skipped": list(res.get("languages_skipped") or []),
-                "files_scanned": int(res.get("files_scanned", 0) or 0),
+                "files_scanned": files_scanned,
             }
         scan = getattr(TreeSitterGuard, "scan_workspace", None)
         if not callable(scan):
@@ -804,6 +851,88 @@ def _run_layer2_meta_rules(target_path: Path, audit_mode: str) -> Dict[str, Any]
         )
 
 
+def _layer2_from_js_scan(ast_scan: Dict[str, Any]) -> Dict[str, Any]:
+    """Reaproveita a Camada 4 já executada dentro de ``scan_js_ast``.
+
+    TICKET-SGA-10 item 1: ``MultiStackRunner.scan_js_ast`` já roda o
+    ``TreeSitterGuard`` sobre os arquivos JS/TS coletados. Chamar
+    ``_run_layer2_meta_rules`` depois disso varria o workspace uma segunda vez.
+    Este adaptador normaliza o sub-resultado bruto (``tree_sitter_scan``) no
+    mesmo contrato de ``_run_layer2_meta_rules`` sem reexecutar nada.
+    """
+    raw = ast_scan.get("tree_sitter_scan")
+    if not isinstance(raw, dict):
+        state = str(ast_scan.get("tree_sitter_layer_status") or "not_executed")
+        return {
+            "available": bool(ast_scan.get("tree_sitter_layer_status")),
+            "blocking": [],
+            "warnings": [],
+            "total_files": int(ast_scan.get("tree_sitter_files", 0) or 0),
+            "layer_status": state,
+            "layers_executed": [LAYER_TREE_SITTER] if state == "executed" else [],
+            "layers_skipped": [] if state == "executed" else [LAYER_TREE_SITTER],
+            "skip_reasons": dict(ast_scan.get("tree_sitter_skip_reasons") or {}),
+            "inconclusive_reasons": list(ast_scan.get("tree_sitter_inconclusive_reasons") or []),
+            "engine": str(ast_scan.get("tree_sitter_engine") or "unavailable"),
+            "degraded": False,
+            "languages": [],
+            "languages_skipped": [],
+            "files_scanned": int(ast_scan.get("tree_sitter_files", 0) or 0),
+        }
+    state = str(raw.get("layer_status") or "executed")
+    return {
+        "available": True,
+        "blocking": list(raw.get("blocking") or []),
+        "warnings": list(raw.get("warnings") or []),
+        "total_files": int(raw.get("total_files", 0) or 0),
+        "layer_status": state,
+        "layers_executed": list(raw.get("layers_executed") or []),
+        "layers_skipped": list(raw.get("layers_skipped") or []),
+        "skip_reasons": dict(raw.get("skip_reasons") or {}),
+        "inconclusive_reasons": list(raw.get("inconclusive_reasons") or []),
+        "engine": str(raw.get("engine") or "tree_sitter"),
+        "degraded": bool(raw.get("degraded")),
+        "languages": list(raw.get("languages") or []),
+        "languages_skipped": list(raw.get("languages_skipped") or []),
+        "files_scanned": int(raw.get("files_scanned", raw.get("total_files", 0)) or 0),
+    }
+
+
+def _inherited_non_approval_verdict(test_verdict: str) -> str:
+    """Veredito não aprovador herdado da Camada 0 (modo diagnóstico estático)."""
+    if test_verdict == VerdictState.INCONCLUSIVE.value:
+        return VerdictState.INCONCLUSIVE.value
+    if test_verdict == VerdictState.NOT_APPLICABLE.value:
+        return VerdictState.NOT_APPLICABLE.value
+    return VerdictState.VERIFIED_FAIL.value
+
+
+def _static_verdict_state(
+    critical_failures: List[str],
+    blocking_count: int,
+    inconclusive_reasons: List[str],
+) -> Optional[str]:
+    """Precedência estrita das camadas estáticas (TICKET-SGA-10 item 2).
+
+    Devolve ``None`` quando a entrega pode ser aprovada; caso contrário o
+    veredito não aprovador. Simetria garantida entre o ramo JS/TS e o Python:
+    ferramenta crítica > bloqueio > cobertura inconclusiva.
+
+    Exemplo:
+        >>> _static_verdict_state([], 0, ["gramática ausente"]) == VerdictState.INCONCLUSIVE.value
+        True
+        >>> _static_verdict_state([], 0, []) is None
+        True
+    """
+    if critical_failures:
+        return VerdictState.INCONCLUSIVE.value
+    if blocking_count:
+        return VerdictState.VERIFIED_FAIL.value
+    if inconclusive_reasons:
+        return VerdictState.INCONCLUSIVE.value
+    return None
+
+
 async def _quality_guard_core(
     task_type: str = "codigo_producao",
     workspace: str = "",
@@ -812,6 +941,7 @@ async def _quality_guard_core(
     resultado: str = "",
     engine: Any = None,
     audit_mode: str = "delta",
+    static_diagnostic: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict:
     """Homologa uma entrega com pipeline 100% determinístico (sem ML/Laya).
@@ -826,6 +956,12 @@ async def _quality_guard_core(
     ``engine`` é aceito apenas por retrocompatibilidade de assinatura e é
     IGNORADO: a validação de entrega não usa Laya RLCD/Noul nem inferência na GPU.
 
+    ``static_diagnostic`` (TICKET-SGA-11 F2): executa as camadas estáticas mesmo
+    quando a Camada 0 falha, para permitir diagnóstico da entrega com a suíte
+    vermelha. NUNCA aprova: o veredito herda o resultado não-aprovador da
+    Camada 0 (ou vira ``INCONCLUSIVE`` se uma ferramenta crítica falhar). O
+    comportamento padrão continua sendo fail-fast.
+
     Exemplo:
         >>> import asyncio, tempfile
         >>> with tempfile.TemporaryDirectory() as ws:
@@ -834,10 +970,17 @@ async def _quality_guard_core(
         True
     """
     del engine  # retrocompat de assinatura: ML/Laya removido do caminho crítico
+    static_diagnostic = bool(static_diagnostic) or audit_mode == "static_diagnostic"
     target_workspace = workspace.strip() if workspace and workspace.strip() else os.getcwd()
 
     hist = _history_get(target_workspace)
     current_attempt = _resolve_attempt_number(hist)
+    if hist and hist.get("emergency"):
+        # Laudo terminal já emitido: não consumir novas tentativas nem sair do
+        # teto do circuit breaker (re-execução no mesmo commit é status terminal).
+        current_attempt = min(
+            int(hist.get("attempts", MAX_ATTEMPTS) or MAX_ATTEMPTS), MAX_ATTEMPTS,
+        )
     if attempt_number != current_attempt:
         logger.info(
             "attempt_number do chamador (%s) é informativo; tentativa real server-side = %s.",
@@ -845,47 +988,54 @@ async def _quality_guard_core(
             current_attempt,
         )
 
-    # ── 1. CIRCUIT BREAKER UNIVERSAL (Limite de 5 Tentativas -> Saída de Emergência) ──
+    # ── 1. CIRCUIT BREAKER UNIVERSAL (limite de 5 tentativas -> laudo de inviabilidade) ──
     if current_attempt >= MAX_ATTEMPTS:
         already_emergency = bool(hist and hist.get("emergency"))
         if already_emergency:
             logger.warning(
-                f"🚨 [Circuit Breaker - STATUS TERMINAL] Saída de Emergência já liberada anteriormente "
-                f"para {target_workspace}. Re-execução sem novo commit bloqueada; mantendo liberação com ressalva."
+                f"🚨 [Circuit Breaker - STATUS TERMINAL] Laudo de inviabilidade já emitido para "
+                f"{target_workspace}. Re-execução sem novo commit bloqueada."
             )
             msg = (
-                f"🚨 [Circuit Breaker - STATUS TERMINAL] Saída de Emergência ativada na tentativa "
-                f"{current_attempt}/{MAX_ATTEMPTS}. Entrega liberada COM RESSALVA. "
-                "Ciclo de tentativas ENCERRADO. NÃO re-execute needle_verify_delivery para este mesmo commit. "
-                "Comite as alterações (git commit) para iniciar novo ciclo, ou proceda imediatamente "
-                "para a auditoria do Revisor Crítico (subagent_adversarial) acompanhada do Laudo Técnico."
+                f"🚨 [Circuit Breaker - STATUS TERMINAL/INVIÁVEL] Limite de tentativas já consumido "
+                f"({current_attempt}/{MAX_ATTEMPTS}) para este commit. NÃO HÁ APROVAÇÃO: nenhuma evidência "
+                "foi executada nesta chamada. NÃO re-execute needle_verify_delivery para este mesmo commit: "
+                "comite as alterações (git commit) para iniciar novo ciclo ou trate as falhas apontadas "
+                "no Laudo de Inviabilidade Técnica."
             )
         else:
-            logger.warning(f"🚨 [Circuit Breaker] 5ª tentativa atingida em {target_workspace}. Saída de Emergência liberada.")
+            logger.warning(
+                f"🚨 [Circuit Breaker] {MAX_ATTEMPTS}ª tentativa atingida em {target_workspace}; "
+                "nenhuma evidência executada — aprovação recusada."
+            )
             msg = (
-                f"🚨 [Circuit Breaker - STATUS TERMINAL] Saída de Emergência ativada na tentativa "
-                f"{current_attempt}/{MAX_ATTEMPTS}. Entrega liberada COM RESSALVA "
-                "(pytest/Guard/Screener NÃO executados nesta chamada). Ciclo de tentativas encerrado: "
-                "proceda imediatamente com a auditoria do Revisor Crítico e Laudo Técnico de Inviabilidade."
+                f"🚨 [Circuit Breaker - STATUS TERMINAL/INVIÁVEL] {MAX_ATTEMPTS}ª tentativa sem aprovação. "
+                "Laudo de Inviabilidade Técnica: pytest/Guard/Screener NÃO executados nesta chamada e "
+                "não há evidência real que sustente uma liberação. NÃO APROVADO (passed=false). "
+                "Comite as alterações para iniciar novo ciclo ou corrija as falhas registradas."
             )
 
-        emergency_reason = "circuit breaker: 5ª tentativa sem aprovação (nenhuma camada executada)"
+        emergency_reason = (
+            "circuit breaker: 5ª tentativa sem aprovação; nenhuma evidência executada "
+            "(Laudo de Inviabilidade Técnica — não aprovado)"
+        )
         emergency_coverage = _layer_coverage(
             [],
             statuses={layer: "emergency_release" for layer in _ALL_LAYERS},
             skip_reasons={layer: emergency_reason for layer in _ALL_LAYERS},
         )
+        # TICKET-SGA-11 F4: EMERGENCY_RELEASE nunca aprova sem evidência executada.
         _history_set(target_workspace, {
-            "passed": True,
+            "passed": False,
             "attempts": current_attempt,
             "emergency": True
         })
         return AgentQualityGuardResponse(
-            passed=True,
+            passed=False,
             status="EMERGENCY_RELEASE",
             attempt_number=current_attempt,
-            approved_with_caveat=True,
-            verdict_state=VerdictState.EMERGENCY_RELEASE.value,
+            approved_with_caveat=False,
+            verdict_state=VerdictState.INCONCLUSIVE.value,
             evidence_executed=False,
             pedido_audit=pedido or None,
             resultado_audit=resultado or None,
@@ -895,8 +1045,8 @@ async def _quality_guard_core(
             structural_ast_warnings=[],
             confirmed_defects=[],
             dismissed_warnings=[],
-            total_files_scanned=0,
-            total_lines_scanned=0,
+            total_files_scanned=None,
+            total_lines_scanned=None,
             inconclusive_reasons=[emergency_reason],
             **emergency_coverage,
             message=msg + " | " + _fail_fast_notice(emergency_coverage["layers_skipped"]),
@@ -922,11 +1072,8 @@ async def _quality_guard_core(
             failure_details=test_res.get("failure_details", []),
         )]
 
+        static_test_failure: Optional[Dict[str, Any]] = None
         if not test_success:
-            _history_set(target_workspace, {
-                "passed": False,
-                "attempts": current_attempt
-            })
             verdict_state = (
                 test_verdict
                 if test_verdict in (
@@ -936,49 +1083,64 @@ async def _quality_guard_core(
                 )
                 else VerdictState.VERIFIED_FAIL.value
             )
-            executed_status = "failed" if verdict_state == VerdictState.VERIFIED_FAIL.value else "inconclusive"
-            reason = (
-                f"fail-fast: layer0_tests não comprovou evidência executada "
-                f"(verdict_state={verdict_state}, reason={test_res.get('reason')})"
-            )
-            # Honestidade de cobertura: sem evidência real a camada de testes NÃO
-            # é anunciada como executada (contradiria evidence_executed=False).
-            test_layers = [LAYER_TESTS] if test_evidence else []
-            coverage = _layer_coverage(
-                test_layers,
-                statuses={LAYER_TESTS: executed_status},
-                skip_reasons={layer: reason for layer in _ALL_LAYERS if layer not in test_layers},
-            )
-            return AgentQualityGuardResponse(
-                passed=False,
-                status="REJECTED",
-                attempt_number=current_attempt,
-                pytest_success=False,
-                pytest_chunks=pytest_chunks_typed,
-                blocking_ast_violations=[],
-                structural_ast_warnings=[],
-                confirmed_defects=[],
-                dismissed_warnings=[],
-                total_files_scanned=0,
-                total_lines_scanned=0,
-                verdict_state=verdict_state,
-                evidence_executed=test_evidence,
-                inconclusive_reasons=(
-                    [str(test_res.get("summary", ""))]
-                    if verdict_state == VerdictState.INCONCLUSIVE.value else []
-                ),
-                pedido_audit=pedido or None,
-                resultado_audit=resultado or None,
-                **coverage,
-                message=(
-                    f"🚨 [{stack} Fail-Fast] Suíte de testes não aprovada: {test_res.get('summary', '')}. "
-                    f"verdict_state={verdict_state}. " + _fail_fast_notice(coverage["layers_skipped"])
+            if not static_diagnostic:
+                _history_set(target_workspace, {
+                    "passed": False,
+                    "attempts": current_attempt
+                })
+                executed_status = "failed" if verdict_state == VerdictState.VERIFIED_FAIL.value else "inconclusive"
+                reason = (
+                    f"fail-fast: layer0_tests não comprovou evidência executada "
+                    f"(verdict_state={verdict_state}, reason={test_res.get('reason')})"
                 )
-            ).model_dump()
+                # Honestidade de cobertura: sem evidência real a camada de testes NÃO
+                # é anunciada como executada (contradiria evidence_executed=False).
+                test_layers = [LAYER_TESTS] if test_evidence else []
+                coverage = _layer_coverage(
+                    test_layers,
+                    statuses={LAYER_TESTS: executed_status},
+                    skip_reasons={layer: reason for layer in _ALL_LAYERS if layer not in test_layers},
+                )
+                return AgentQualityGuardResponse(
+                    passed=False,
+                    status="REJECTED",
+                    attempt_number=current_attempt,
+                    pytest_success=False,
+                    pytest_chunks=pytest_chunks_typed,
+                    blocking_ast_violations=[],
+                    structural_ast_warnings=[],
+                    confirmed_defects=[],
+                    dismissed_warnings=[],
+                    total_files_scanned=None,
+                    total_lines_scanned=None,
+                    verdict_state=verdict_state,
+                    evidence_executed=test_evidence,
+                    inconclusive_reasons=(
+                        [str(test_res.get("summary", ""))]
+                        if verdict_state == VerdictState.INCONCLUSIVE.value else []
+                    ),
+                    pedido_audit=pedido or None,
+                    resultado_audit=resultado or None,
+                    **coverage,
+                    message=(
+                        f"🚨 [{stack} Fail-Fast] Suíte de testes não aprovada: {test_res.get('summary', '')}. "
+                        f"verdict_state={verdict_state}. " + _fail_fast_notice(coverage["layers_skipped"])
+                    )
+                ).model_dump()
+            # Modo diagnóstico estático (TICKET-SGA-11 F2): segue para as camadas
+            # estáticas, mas o veredito final nunca aprova.
+            static_test_failure = {
+                "verdict_state": verdict_state,
+                "evidence": test_evidence,
+                "reason": test_res.get("reason"),
+                "summary": str(test_res.get("summary", "")),
+            }
 
         if stack in _JS_MULTISTACK_STACKS:
             ast_scan = MultiStackRunner.scan_js_ast(target_path, stack, audit_mode=audit_mode)
-            layer2 = _run_layer2_meta_rules(target_path, audit_mode)
+            # TICKET-SGA-10 item 1: a Camada 4 já executou dentro de scan_js_ast.
+            # Reaproveita o resultado bruto em vez de rodar o TreeSitterGuard 2x.
+            layer2 = _layer2_from_js_scan(ast_scan)
 
             blocking_violations = _dedup_typed(_coerce_violations(ast_scan.get("blocking", []), ASTViolation))
             structural_warnings = _dedup_typed(
@@ -997,7 +1159,7 @@ async def _quality_guard_core(
             layer1_diags = [item for item in layer1_diags if item is not None]
             toolchain_status = _coerce_violations(ast_scan.get("native_tools", []), ToolchainToolStatus)
 
-            scan_executed = [LAYER_TESTS] + [
+            scan_executed = ([LAYER_TESTS] if test_evidence else []) + [
                 layer for layer in (LAYER_NATIVE, LAYER_TREE_SITTER)
                 if layer in (ast_scan.get("layers_executed") or [])
             ]
@@ -1012,10 +1174,16 @@ async def _quality_guard_core(
             )
             native_state = (ast_scan.get("layer_status") or {}).get(LAYER_NATIVE, "executed")
             ts_state = (ast_scan.get("layer_status") or {}).get(LAYER_TREE_SITTER, "executed")
+            if static_test_failure is not None:
+                tests_state = (
+                    "failed" if static_test_failure["evidence"] else "inconclusive"
+                )
+            else:
+                tests_state = "executed"
             coverage = _layer_coverage(
                 scan_executed,
                 statuses={
-                    LAYER_TESTS: "executed",
+                    LAYER_TESTS: tests_state,
                     LAYER_NATIVE: native_state,
                     LAYER_TREE_SITTER: ts_state,
                     LAYER_AST_GUARD: "not_applicable",
@@ -1025,8 +1193,33 @@ async def _quality_guard_core(
             )
 
             critical_failures = ast_scan.get("critical_failures") or []
-            inconclusive = ast_scan.get("inconclusive_reasons") or []
-            if critical_failures:
+            # Simetria com o ramo Python (TICKET-SGA-10 item 2): motivos
+            # inconclusivos da Camada 3/4 impedem VERIFIED_PASS.
+            inconclusive = list(dict.fromkeys(
+                list(ast_scan.get("inconclusive_reasons") or [])
+                + list(layer2.get("inconclusive_reasons") or [])
+            ))
+            static_verdict = _static_verdict_state(
+                list(critical_failures), len(blocking_violations), inconclusive,
+            )
+            static_layers_ran = any(
+                layer in scan_executed for layer in (LAYER_NATIVE, LAYER_TREE_SITTER)
+            )
+            if static_test_failure is not None:
+                passed = False
+                status_label = "REJECTED"
+                verdict_state = _inherited_non_approval_verdict(
+                    str(static_test_failure["verdict_state"])
+                )
+                if static_verdict is not None:
+                    verdict_state = static_verdict
+                message = (
+                    f"🔎 [{stack} STATIC DIAGNOSTIC] Camada 0 não aprovada "
+                    f"({static_test_failure['summary']}; verdict_state={verdict_state}). "
+                    f"Achados estáticos: {len(blocking_violations)} bloqueio(s), "
+                    f"{len(structural_warnings)} alerta(s). NÃO APROVADO."
+                )
+            elif static_verdict == VerdictState.INCONCLUSIVE.value and critical_failures:
                 passed = False
                 verdict_state = VerdictState.INCONCLUSIVE.value
                 status_label = "REJECTED"
@@ -1035,13 +1228,22 @@ async def _quality_guard_core(
                     f"({', '.join(critical_failures)}). Nenhum veredito silencioso de '0 erros'. "
                     + _fail_fast_notice([layer for layer in coverage["layers_skipped"]])
                 )
-            elif blocking_violations:
+            elif static_verdict == VerdictState.VERIFIED_FAIL.value:
                 passed = False
                 verdict_state = VerdictState.VERIFIED_FAIL.value
                 status_label = "REJECTED"
                 message = (
                     f"🚨 [{stack}] {test_res.get('summary', '')} | "
                     f"{len(blocking_violations)} bloqueio(s); {len(structural_warnings)} alerta(s)."
+                )
+            elif static_verdict == VerdictState.INCONCLUSIVE.value:
+                passed = False
+                verdict_state = VerdictState.INCONCLUSIVE.value
+                status_label = "REJECTED"
+                message = (
+                    f"🚨 [{stack}] Camada(s) estática(s) INCONCLUSIVE: "
+                    f"{'; '.join(inconclusive[:3])}. "
+                    + _fail_fast_notice([layer for layer in coverage["layers_skipped"]])
                 )
             else:
                 passed = True
@@ -1061,16 +1263,16 @@ async def _quality_guard_core(
                 passed=passed,
                 status=status_label,
                 attempt_number=current_attempt,
-                pytest_success=True,
+                pytest_success=test_success,
                 pytest_chunks=pytest_chunks_typed,
                 blocking_ast_violations=blocking_violations,
                 structural_ast_warnings=structural_warnings,
                 confirmed_defects=[],
                 dismissed_warnings=[],
-                total_files_scanned=max(ast_scan.get("total_files", 0), 0),
-                total_lines_scanned=0,
+                total_files_scanned=int(ast_scan.get("total_files", 0) or 0),
+                total_lines_scanned=int(ast_scan.get("total_lines", 0) or 0),
                 verdict_state=verdict_state,
-                evidence_executed=True,
+                evidence_executed=bool(test_evidence or static_layers_ran),
                 inconclusive_reasons=inconclusive,
                 pedido_audit=pedido or None,
                 resultado_audit=resultado or None,
@@ -1093,10 +1295,17 @@ async def _quality_guard_core(
             LAYER_SCREENER: "Screener Python não aplicável à stack da linguagem",
             LAYER_TREE_SITTER: "meta-regras universais não aplicáveis à stack da linguagem",
         }
+        if static_test_failure is not None:
+            tests_state = "failed" if static_test_failure["evidence"] else "inconclusive"
+        else:
+            tests_state = "executed"
+        native_executed = [LAYER_TESTS, LAYER_NATIVE]
+        if static_test_failure is not None and not static_test_failure["evidence"]:
+            native_executed = [LAYER_NATIVE]
         coverage = _layer_coverage(
-            [LAYER_TESTS, LAYER_NATIVE],
+            native_executed,
             statuses={
-                LAYER_TESTS: "executed",
+                LAYER_TESTS: tests_state,
                 LAYER_NATIVE: layer1.get("layer_status", "skipped"),
                 LAYER_AST_GUARD: "not_applicable",
                 LAYER_SCREENER: "not_applicable",
@@ -1104,7 +1313,21 @@ async def _quality_guard_core(
             },
             skip_reasons=non_js_skips,
         )
-        if critical_failures:
+        if static_test_failure is not None:
+            passed = False
+            status_label = "REJECTED"
+            verdict_state = _inherited_non_approval_verdict(
+                str(static_test_failure["verdict_state"])
+            )
+            if critical_failures or inconclusive:
+                verdict_state = VerdictState.INCONCLUSIVE.value
+            message = (
+                f"🔎 [{stack} STATIC DIAGNOSTIC] Camada 0 não aprovada "
+                f"({static_test_failure['summary']}; verdict_state={verdict_state}). "
+                f"Camada 3 nativa: {len(layer1_blocking)} bloqueio(s), "
+                f"{len(layer1_warnings)} alerta(s). NÃO APROVADO."
+            )
+        elif critical_failures:
             passed = False
             verdict_state = VerdictState.INCONCLUSIVE.value
             status_label = "REJECTED"
@@ -1127,16 +1350,19 @@ async def _quality_guard_core(
             passed=passed,
             status=status_label,
             attempt_number=current_attempt,
-            pytest_success=True,
+            pytest_success=test_success,
             pytest_chunks=pytest_chunks_typed,
             blocking_ast_violations=layer1_blocking,
             structural_ast_warnings=layer1_warnings,
             confirmed_defects=[],
             dismissed_warnings=[],
-            total_files_scanned=layer1.get("total_files", 0),
-            total_lines_scanned=0,
+            total_files_scanned=int(layer1.get("total_files", 0) or 0),
+            total_lines_scanned=None,
             verdict_state=verdict_state,
-            evidence_executed=True,
+            evidence_executed=bool(
+                (static_test_failure or {}).get("evidence", test_evidence)
+                or layer1.get("layer_status") == "executed"
+            ),
             inconclusive_reasons=inconclusive,
             pedido_audit=pedido or None,
             resultado_audit=resultado or None,
@@ -1166,8 +1392,8 @@ async def _quality_guard_core(
             structural_ast_warnings=[],
             confirmed_defects=[],
             dismissed_warnings=[],
-            total_files_scanned=0,
-            total_lines_scanned=0,
+            total_files_scanned=None,
+            total_lines_scanned=None,
             verdict_state=VerdictState.INCONCLUSIVE.value,
             evidence_executed=False,
             inconclusive_reasons=[reason],
@@ -1226,46 +1452,53 @@ async def _quality_guard_core(
             failure_details=c.get("failure_details", []),
         ))
 
+    python_static_failure: Optional[Dict[str, Any]] = None
     if not pytest_chunks_typed:
-        _history_set(target_workspace, {
-            "passed": False,
-            "attempts": current_attempt
-        })
-        reason = "fail-fast: nenhum teste Python real coletado (tests/test_*.py ausente)"
-        coverage = _layer_coverage(
-            [LAYER_TESTS],
-            statuses={LAYER_TESTS: "failed"},
-            skip_reasons={layer: reason for layer in _ALL_LAYERS if layer != LAYER_TESTS},
-        )
-        return AgentQualityGuardResponse(
-            passed=False,
-            status="REJECTED",
-            attempt_number=current_attempt,
-            pytest_success=False,
-            pytest_chunks=[],
-            blocking_ast_violations=[],
-            structural_ast_warnings=[],
-            confirmed_defects=[],
-            dismissed_warnings=[],
-            total_files_scanned=0,
-            total_lines_scanned=0,
-            verdict_state=VerdictState.VERIFIED_FAIL.value,
-            evidence_executed=False,
-            inconclusive_reasons=[reason],
-            pedido_audit=pedido or None,
-            resultado_audit=resultado or None,
-            **coverage,
-            message=(
-                "🚨 [Pytest Fail-Fast: TESTES OBRIGATÓRIOS NÃO ENCONTRADOS]\n"
-                f"Nenhum teste coletado — workspace Python '{target_workspace}' sem "
-                "suíte real não pode ser homologado (aprovação sem executar teste é proibida).\n"
-                "👉 AÇÃO OBRIGATÓRIA DO AGENTE: Crie o arquivo de teste 'tests/test_<funcionalidade>.py' "
-                "com testes automatizados reais (sem mocks em src/) cobrindo os caminhos críticos e submeta novamente. "
-                + _fail_fast_notice(coverage["layers_skipped"])
+        no_tests_reason = "fail-fast: nenhum teste Python real coletado (tests/test_*.py ausente)"
+        if not static_diagnostic:
+            _history_set(target_workspace, {
+                "passed": False,
+                "attempts": current_attempt
+            })
+            coverage = _layer_coverage(
+                [LAYER_TESTS],
+                statuses={LAYER_TESTS: "failed"},
+                skip_reasons={layer: no_tests_reason for layer in _ALL_LAYERS if layer != LAYER_TESTS},
             )
-        ).model_dump()
+            return AgentQualityGuardResponse(
+                passed=False,
+                status="REJECTED",
+                attempt_number=current_attempt,
+                pytest_success=False,
+                pytest_chunks=[],
+                blocking_ast_violations=[],
+                structural_ast_warnings=[],
+                confirmed_defects=[],
+                dismissed_warnings=[],
+                total_files_scanned=None,
+                total_lines_scanned=None,
+                verdict_state=VerdictState.VERIFIED_FAIL.value,
+                evidence_executed=False,
+                inconclusive_reasons=[no_tests_reason],
+                pedido_audit=pedido or None,
+                resultado_audit=resultado or None,
+                **coverage,
+                message=(
+                    "🚨 [Pytest Fail-Fast: TESTES OBRIGATÓRIOS NÃO ENCONTRADOS]\n"
+                    f"Nenhum teste coletado — workspace Python '{target_workspace}' sem "
+                    "suíte real não pode ser homologado (aprovação sem executar teste é proibida).\n"
+                    "👉 AÇÃO OBRIGATÓRIA DO AGENTE: Crie o arquivo de teste 'tests/test_<funcionalidade>.py' "
+                    "com testes automatizados reais (sem mocks em src/) cobrindo os caminhos críticos e submeta novamente. "
+                    + _fail_fast_notice(coverage["layers_skipped"])
+                )
+            ).model_dump()
+        python_static_failure = {
+            "verdict_state": VerdictState.VERIFIED_FAIL.value,
+            "evidence": False,
+            "summary": no_tests_reason,
+        }
 
-    if not pytest_success:
+    if not pytest_success and not static_diagnostic:
         _history_set(target_workspace, {
             "passed": False,
             "attempts": current_attempt
@@ -1293,8 +1526,8 @@ async def _quality_guard_core(
             structural_ast_warnings=[],
             confirmed_defects=[],
             dismissed_warnings=[],
-            total_files_scanned=0,
-            total_lines_scanned=0,
+            total_files_scanned=None,
+            total_lines_scanned=None,
             verdict_state=verdict_state,
             evidence_executed=failed_evidence,
             inconclusive_reasons=(
@@ -1310,6 +1543,21 @@ async def _quality_guard_core(
                 + _fail_fast_notice(coverage["layers_skipped"])
             )
         ).model_dump()
+
+    if not pytest_success and python_static_failure is None:
+        # MODO DIAGNÓSTICO ESTÁTICO (TICKET-SGA-11 F2): segue para as camadas
+        # estáticas, mas o veredito final permanece não-aprovador.
+        failed_evidence = bool(pytest_chunks_typed) and any(
+            bool(c.total_passed or c.total_failed) for c in pytest_chunks_typed
+        )
+        python_static_failure = {
+            "verdict_state": (
+                VerdictState.VERIFIED_FAIL.value if chunks_evidence
+                else VerdictState.INCONCLUSIVE.value
+            ),
+            "evidence": failed_evidence,
+            "summary": "suíte de testes reais não aprovada",
+        }
 
     # ── Etapa 1: NeedleASTGuard (Camada 1: Bloqueios de Segurança/Integridade) ──
     if ctx:
@@ -1338,9 +1586,16 @@ async def _quality_guard_core(
             "attempts": current_attempt
         })
         reason = "fail-fast: layer1_ast_guard encontrou violação bloqueante"
+        if python_static_failure is not None:
+            tests_evidence = bool(python_static_failure.get("evidence"))
+            guard_executed = ([LAYER_TESTS] if tests_evidence else []) + [LAYER_AST_GUARD]
+            guard_tests_state = "failed" if tests_evidence else "inconclusive"
+        else:
+            guard_executed = [LAYER_TESTS, LAYER_AST_GUARD]
+            guard_tests_state = "executed"
         coverage = _layer_coverage(
-            [LAYER_TESTS, LAYER_AST_GUARD],
-            statuses={LAYER_TESTS: "executed", LAYER_AST_GUARD: "failed"},
+            guard_executed,
+            statuses={LAYER_TESTS: guard_tests_state, LAYER_AST_GUARD: "failed"},
             skip_reasons={
                 layer: reason for layer in (LAYER_SCREENER, LAYER_NATIVE, LAYER_TREE_SITTER)
             },
@@ -1349,14 +1604,14 @@ async def _quality_guard_core(
             passed=False,
             status="REJECTED",
             attempt_number=current_attempt,
-            pytest_success=True,
+            pytest_success=pytest_success,
             pytest_chunks=pytest_chunks_typed,
             blocking_ast_violations=blocking_violations,
             structural_ast_warnings=[],
             confirmed_defects=[],
             dismissed_warnings=[],
-            total_files_scanned=len(ast_violations),
-            total_lines_scanned=0,
+            total_files_scanned=int(ast_report.get("files_scanned", 0)),
+            total_lines_scanned=None,
             verdict_state=VerdictState.VERIFIED_FAIL.value,
             evidence_executed=True,
             pedido_audit=pedido or None,
@@ -1429,14 +1684,28 @@ async def _quality_guard_core(
     ts_state = str(layer2.get("layer_status") or ("executed" if layer2.get("available") else "not_executed"))
     ast_state = str(ast_report.get("layer_status") or "not_executed")
     screener_state = str(screener_report.get("layer_status") or "not_executed")
+    if python_static_failure is not None:
+        tests_state = (
+            "failed" if python_static_failure.get("evidence") else "inconclusive"
+        )
+    else:
+        tests_state = "executed"
     layer_states = {
-        LAYER_TESTS: "executed",
+        LAYER_TESTS: tests_state,
         LAYER_AST_GUARD: ast_state,
         LAYER_SCREENER: screener_state,
         LAYER_NATIVE: native_state,
         LAYER_TREE_SITTER: ts_state,
     }
     executed_layers = [layer for layer in _ALL_LAYERS if layer_states[layer] == "executed"]
+    if (
+        python_static_failure is not None
+        and python_static_failure.get("evidence")
+        and LAYER_TESTS not in executed_layers
+    ):
+        # Os testes EXECUTARAM (com falha): a camada entra como executada com
+        # status ``failed`` para não esconder evidência real coletada.
+        executed_layers = [LAYER_TESTS] + executed_layers
     coverage = _layer_coverage(
         executed_layers,
         statuses=layer_states,
@@ -1464,13 +1733,13 @@ async def _quality_guard_core(
             passed=False,
             status="REJECTED",
             attempt_number=current_attempt,
-            pytest_success=True,
+            pytest_success=pytest_success,
             pytest_chunks=pytest_chunks_typed,
             blocking_ast_violations=combined_blocking,
             structural_ast_warnings=structural_warnings,
             confirmed_defects=[],
             dismissed_warnings=[],
-            total_files_scanned=max(len(symbols), layer1["total_files"], layer2["total_files"]),
+            total_files_scanned=int(ast_report.get("files_scanned", 0)),
             total_lines_scanned=sum(sym.end_line - sym.start_line + 1 for sym in symbols),
             verdict_state=VerdictState.INCONCLUSIVE.value,
             evidence_executed=True,
@@ -1497,13 +1766,13 @@ async def _quality_guard_core(
             passed=False,
             status="REJECTED",
             attempt_number=current_attempt,
-            pytest_success=True,
+            pytest_success=pytest_success,
             pytest_chunks=pytest_chunks_typed,
             blocking_ast_violations=combined_blocking,
             structural_ast_warnings=structural_warnings,
             confirmed_defects=[],
             dismissed_warnings=[],
-            total_files_scanned=max(len(symbols), layer1["total_files"], layer2["total_files"]),
+            total_files_scanned=int(ast_report.get("files_scanned", 0)),
             total_lines_scanned=sum(sym.end_line - sym.start_line + 1 for sym in symbols),
             verdict_state=VerdictState.VERIFIED_FAIL.value,
             evidence_executed=True,
@@ -1526,13 +1795,13 @@ async def _quality_guard_core(
             passed=False,
             status="REJECTED",
             attempt_number=current_attempt,
-            pytest_success=True,
+            pytest_success=pytest_success,
             pytest_chunks=pytest_chunks_typed,
             blocking_ast_violations=combined_blocking,
             structural_ast_warnings=structural_warnings,
             confirmed_defects=[],
             dismissed_warnings=[],
-            total_files_scanned=max(len(symbols), layer1["total_files"], layer2["total_files"]),
+            total_files_scanned=int(ast_report.get("files_scanned", 0)),
             total_lines_scanned=sum(sym.end_line - sym.start_line + 1 for sym in symbols),
             verdict_state=VerdictState.INCONCLUSIVE.value,
             evidence_executed=True,
@@ -1547,6 +1816,46 @@ async def _quality_guard_core(
                 "🚨 [Quality Guard INCONCLUSIVE] Camada(s) de AST não comprovaram cobertura "
                 f"completa: {'; '.join(inconclusive_reasons[:3])}. "
                 + _fail_fast_notice(coverage["layers_skipped"])
+            ),
+        ).model_dump()
+
+    if python_static_failure is not None:
+        _history_set(target_workspace, {"passed": False, "attempts": current_attempt})
+        inherited = _inherited_non_approval_verdict(
+            str(python_static_failure.get("verdict_state"))
+        )
+        static_reason = (
+            "diagnóstico estático: Camada 0 não aprovada "
+            f"({python_static_failure.get('summary')})"
+        )
+        if inherited == VerdictState.INCONCLUSIVE.value and not inconclusive_reasons:
+            inconclusive_reasons = [static_reason]
+        return AgentQualityGuardResponse(
+            passed=False,
+            status="REJECTED",
+            attempt_number=current_attempt,
+            pytest_success=pytest_success,
+            pytest_chunks=pytest_chunks_typed,
+            blocking_ast_violations=combined_blocking,
+            structural_ast_warnings=structural_warnings,
+            confirmed_defects=[],
+            dismissed_warnings=[],
+            total_files_scanned=int(ast_report.get("files_scanned", 0)),
+            total_lines_scanned=sum(sym.end_line - sym.start_line + 1 for sym in symbols),
+            verdict_state=inherited,
+            evidence_executed=bool(coverage["layers_executed"]),
+            inconclusive_reasons=inconclusive_reasons,
+            pedido_audit=pedido or None,
+            resultado_audit=resultado or None,
+            layer1_toolchain_diagnostics=layer1_toolchain_diagnostics,
+            toolchain_status=toolchain_status,
+            layer2_meta_rule_violations=layer2_meta_rule_violations,
+            **coverage,
+            message=(
+                f"🔎 [Quality Guard STATIC DIAGNOSTIC] Camada 0 não aprovada "
+                f"({python_static_failure.get('summary')}; verdict_state={inherited}). "
+                f"Achados estáticos: {len(combined_blocking)} bloqueio(s), "
+                f"{len(structural_warnings)} alerta(s). NÃO APROVADO."
             ),
         ).model_dump()
 
@@ -1578,7 +1887,11 @@ async def _quality_guard_core(
         structural_ast_warnings=structural_warnings,
         confirmed_defects=[],
         dismissed_warnings=[],
-        total_files_scanned=max(len(symbols), layer1["total_files"], layer2["total_files"]),
+        total_files_scanned=max(
+            int(ast_report.get("files_scanned", 0) or 0),
+            int(layer1.get("total_files", 0) or 0),
+            int(layer2.get("files_scanned", 0) or 0),
+        ),
         total_lines_scanned=sum(sym.end_line - sym.start_line + 1 for sym in symbols),
         verdict_state=VerdictState.VERIFIED_PASS.value,
         evidence_executed=True,

@@ -665,13 +665,27 @@ class NeedleVerifyDeliveryResponse(BaseModel):
         default_factory=list,
         description="Alertas estruturais descartados como falsos-positivos pelo Laya RLCD (JEV Noul P < 0.78)."
     )
-    total_files_scanned: int
-    total_lines_scanned: int
+    total_files_scanned: Optional[int] = Field(
+        default=None,
+        description=(
+            "Arquivos efetivamente escaneados. ``None`` significa NÃO MEDIDO "
+            "(fail-fast/ausência de evidência) — nunca confundir com ``0`` "
+            "medido e vazio (TICKET-SGA-11 F5)."
+        ),
+    )
+    total_lines_scanned: Optional[int] = Field(
+        default=None,
+        description=(
+            "Linhas efetivamente escaneadas. ``None`` significa NÃO MEDIDO "
+            "(fail-fast) — nunca ``0`` como sinônimo de medição vazia."
+        ),
+    )
     approved_with_caveat: bool = Field(
         default=False,
         description=(
-            "true APENAS em EMERGENCY_RELEASE (Saída de Emergência da 5ª tentativa, "
-            "AGENTS.md §2) — entrega liberada com ressalva."
+            "Legado da Saída de Emergência. TICKET-SGA-11 F4: EMERGENCY_RELEASE "
+            "sem evidência executada NUNCA aprova (``passed=False`` e este campo "
+            "permanece False); o circuito terminal emite Laudo de Inviabilidade."
         ),
     )
     # --- Veredito explícito e cobertura das camadas (TICKET-SGA-09) ---
@@ -696,7 +710,22 @@ class NeedleVerifyDeliveryResponse(BaseModel):
     )
     layers_skipped: List[str] = Field(
         default_factory=list,
-        description="Camadas não executadas (fail-fast, ausência de binário, não aplicável).",
+        description=(
+            "Camadas não executadas por omissão real (fail-fast, ausência de binário, "
+            "timeout). Camadas que não se aplicam à stack vivem em "
+            "``layers_not_applicable`` (TICKET-SGA-11 F3)."
+        ),
+    )
+    layers_not_applicable: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Camadas deliberadamente não aplicáveis à stack detectada (ex.: AST Guard "
+            "Python em stack JS). Não são omissões de cobertura (TICKET-SGA-11 F3)."
+        ),
+    )
+    not_applicable_reasons: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Motivo declarado por camada não aplicável (TICKET-SGA-11 F3).",
     )
     skip_reasons: Dict[str, str] = Field(
         default_factory=dict,

@@ -62,7 +62,8 @@ def test_canonical_and_alias_input_schemas_are_identical():
     alias = tools["needle_verify_delivery"]
     assert canonical.parameters == alias.parameters
     assert set(canonical.parameters["properties"]) == {
-        "task_type", "workspace", "attempt_number", "pedido", "resultado", "engine", "audit_mode",
+        "task_type", "workspace", "attempt_number", "pedido", "resultado", "engine",
+        "audit_mode", "static_diagnostic",
     }
     assert "SEM ML" in canonical.description or "determinística" in canonical.description
     assert "Alias legado" in alias.description
@@ -316,8 +317,10 @@ def test_quality_guard_core_circuit_breaker_emergency_release():
         emergency = asyncio.run(_quality_guard_core(workspace=tmp))
         assert emergency["status"] == "EMERGENCY_RELEASE"
         assert emergency["attempt_number"] == 5
-        assert emergency["passed"] is True
-        assert emergency["approved_with_caveat"] is True
+        # TICKET-SGA-11 F4: sem evidência executada NUNCA há aprovação.
+        assert emergency["passed"] is False
+        assert emergency["approved_with_caveat"] is False
+        assert emergency["evidence_executed"] is False
         assert emergency["pytest_success"] is False
         assert "STATUS TERMINAL" in emergency["message"]
 
