@@ -598,6 +598,53 @@ class QmdHybridSearchEngine:
 
         return results_by_file, warnings, degraded_lanes
 
+    def _build_timeout_response(
+        self, effective_timeout: float, elapsed_ms: float
+    ) -> Dict[str, Any]:
+        """Monta a resposta canônica e imutável de timeout global da busca híbrida.
+
+        Ponto único de verdade para o veredito ``status="timeout"``: consumido
+        tanto pelo handler de :class:`asyncio.TimeoutError` quanto pela
+        re-checagem de deadline executada depois do ``gather`` das lanes.
+        A segunda chamada existe porque o timer do ``asyncio.wait_for`` tem
+        granularidade de milissegundos (kqueue no macOS): as lanes podem
+        concluir antes do tick do timer mesmo com o tempo total já estourado,
+        e o motor devolveria ``status="partial"`` (ripgrep degradado) sem nunca
+        sinalizar o estouro da cota global.
+
+        Exemplo:
+            >>> res = QmdHybridSearchEngine()._build_timeout_response(0.5, 12.0)
+            >>> res["status"], res["timeout_s"], res["degraded_lanes"]
+            ('timeout', 0.5, ['global_timeout'])
+            >>> res["snippets_count"], res["latency_ms"]
+            (0, 12.0)
+        """
+        logger.warning(
+            "cirurgic_search: timeout global de %.2fs atingido "
+            "(latência até aqui: %.1f ms) — refine `scope` ou aumente "
+            "`timeout`.",
+            effective_timeout,
+            elapsed_ms,
+        )
+        return {
+            "status": "timeout",
+            "latency_ms": elapsed_ms,
+            "total_tokens": 0,
+            "token_savings_pct": 0.0,
+            "snippets_count": 0,
+            "files_found": 0,
+            "snippets": [],
+            "timeout_s": effective_timeout,
+            "message": (
+                f"Busca híbrida excedeu {effective_timeout}s. "
+                "Restrinja `scope` ou aumente `timeout` (<=0 desativa)."
+            ),
+            "warnings": [
+                f"Busca híbrida excedeu o timeout global de {effective_timeout}s."
+            ],
+            "degraded_lanes": ["global_timeout"],
+        }
+
     async def search(
         self,
         query: str,
@@ -618,7 +665,11 @@ class QmdHybridSearchEngine:
           ``['ripgrep_lexical']``, ``['needle_ast']``, ``['global_timeout']``) e
           ``warnings`` carrega o motivo (timeout, I/O, teto de tokens).
         * ``timeout`` é a cota global por requisição em segundos (padrão 15 s;
-          <= 0 desativa).
+          <= 0 desativa). A cota é verificada duas vezes: pelo
+          ``asyncio.wait_for`` e por uma re-checagem de deadline depois do
+          ``gather`` (o timer do event loop tem granularidade de milissegundos,
+          então as lanes podem concluir antes do tick sem que o estouro da cota
+          seja observado); em ambos os casos o veredito é ``'timeout'``.
         * ``depth`` (padrão ``None`` = profundidade ILIMITADA) corta a árvore de
           diretórios em ``depth`` níveis abaixo de cada alvo de escopo e sobrepõe
           ``relational_depth`` do Needle 3 quando enviado — clientes que já
@@ -691,36 +742,22 @@ class QmdHybridSearchEngine:
                 grep_task.cancel()
                 needle_task.cancel()
                 elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-                logger.warning(
-                    "cirurgic_search: timeout global de %.2fs atingido "
-                    "(latência até aqui: %.1f ms) — refine `scope` ou aumente "
-                    "`timeout`.",
-                    effective_timeout,
-                    elapsed_ms,
-                )
-                return {
-                    "status": "timeout",
-                    "latency_ms": elapsed_ms,
-                    "total_tokens": 0,
-                    "token_savings_pct": 0.0,
-                    "snippets_count": 0,
-                    "files_found": 0,
-                    "snippets": [],
-                    "timeout_s": effective_timeout,
-                    "message": (
-                        f"Busca híbrida excedeu {effective_timeout}s. "
-                        "Restrinja `scope` ou aumente `timeout` (<=0 desativa)."
-                    ),
-                    "warnings": [
-                        f"Busca híbrida excedeu o timeout global de {effective_timeout}s."
-                    ],
-                    "degraded_lanes": ["global_timeout"],
-                }
+                return self._build_timeout_response(effective_timeout, elapsed_ms)
         else:
             (
                 (grep_results, grep_warnings, grep_degraded),
                 (needle_resp, needle_warnings, needle_degraded),
             ) = await asyncio.gather(grep_task, needle_task)
+
+        # Checagem de deadline PÓS-gather: garante o contrato de cota global
+        # mesmo quando o `wait_for` não dispara. Nesse caminho as duas lanes já
+        # concluíram (nada órfão), mas o tempo total pode ter estourado a cota
+        # — devolver `partial` mascararia o timeout.
+        elapsed_s = time.perf_counter() - t0
+        if effective_timeout > 0 and elapsed_s >= effective_timeout:
+            return self._build_timeout_response(
+                effective_timeout, round(elapsed_s * 1000.0, 2)
+            )
 
         warnings: List[str] = list(grep_warnings) + list(needle_warnings)
         degraded_lanes: List[str] = list(grep_degraded) + list(needle_degraded)

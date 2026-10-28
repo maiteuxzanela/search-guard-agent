@@ -123,17 +123,30 @@ def test_qmd_search_estimate_tokens_type_error():
 
 @pytest.mark.asyncio
 async def test_global_timeout_leaves_no_pending_lane_tasks(sample_workspace: Path):
-    """Comportamental: após ``status="timeout"`` não sobra nenhuma task de lane órfã.
+    """Comportamental: ``status="timeout"`` é determinístico e não sobra lane órfã.
+
+    Regressão do runner macOS (Python 3.10): o timer do ``asyncio.wait_for`` tem
+    granularidade de milissegundos (kqueue), então com cota de 100 µs as duas
+    lanes podiam concluir ANTES do tick do timer — o ``gather`` retornava
+    normalmente, o motor via ``degraded_lanes=['ripgrep_lexical']`` e devolvia
+    ``'partial'`` mesmo com o tempo total já estourado. A re-checagem de
+    deadline pós-``gather`` (``_build_timeout_response``) fecha essa janela em
+    qualquer SO, sem depender de sleep nem de ordenação de threads.
 
     ``grep_task`` (ripgrep em thread) e ``needle_task`` (AST) são criados antes
-    do ``asyncio.wait_for`` do timeout global; a espera abaixo é ativa (estado
-    + deadline duro de 5 s), sem sleep cego de sincronização.
+    do ``asyncio.wait_for``; a espera abaixo é ativa (estado + deadline duro de
+    5 s), sem sleep cego de sincronização.
     """
     engine = QmdHybridSearchEngine(workspace_root=str(sample_workspace))
     res = await engine.search(query="calculate_total_billing", timeout=0.0001)
 
     assert res["status"] == "timeout"
     assert res["timeout_s"] == 0.0001
+    assert res["degraded_lanes"] == ["global_timeout"]
+    assert res["snippets_count"] == 0
+    # A cota foi de fato consumida: 100 µs é ordens de grandeza abaixo do custo
+    # de spawnar o ripgrep, então a latência medida nunca fica abaixo da cota.
+    assert res["latency_ms"] >= 0.1
 
     deadline = time.monotonic() + 5.0
     while True:
@@ -148,6 +161,44 @@ async def test_global_timeout_leaves_no_pending_lane_tasks(sample_workspace: Pat
     assert not pending, (
         f"task(s) de lane ainda pendente(s) após timeout global: "
         f"{[t.get_name() for t in pending]}"
+    )
+
+
+def test_build_timeout_response_contract():
+    """Contrato da resposta de timeout: payload estrito, sem snippets parciais."""
+    res = QmdHybridSearchEngine()._build_timeout_response(0.25, 42.5)
+
+    assert res["status"] == "timeout"
+    assert res["timeout_s"] == 0.25
+    assert res["latency_ms"] == 42.5
+    assert res["degraded_lanes"] == ["global_timeout"]
+    assert res["snippets"] == []
+    assert res["snippets_count"] == 0
+    assert res["files_found"] == 0
+    assert res["total_tokens"] == 0
+    assert res["token_savings_pct"] == 0.0
+    assert res["warnings"] and "timeout global de 0.25s" in res["warnings"][0]
+
+
+def test_global_deadline_rechecked_after_gather():
+    """Contrato estrutural: o deadline é re-checado DEPOIS do gather das lanes.
+
+    O handler de ``asyncio.TimeoutError`` sozinho não basta — no macOS o
+    ``wait_for`` pode não disparar com as lanes concluídas após a cota. O teste
+    trava a ordem no código-fonte: sem a re-checagem pós-``gather``, o motor
+    volta a responder ``'partial'`` no cenário de race condition.
+    """
+    src = inspect.getsource(QmdHybridSearchEngine.search)
+    gather_idx = src.find("await asyncio.gather(grep_task, needle_task)")
+    assert gather_idx != -1, "gather das lanes ausente no search() híbrido"
+
+    post_gather = src[gather_idx:]
+    assert "_build_timeout_response" in post_gather, (
+        "re-checagem de deadline ausente após o gather: race condition do "
+        "timer do asyncio no macOS volta a devolver status='partial'"
+    )
+    assert "time.perf_counter() - t0" in post_gather, (
+        "a re-checagem pós-gather precisa medir o tempo total desde t0"
     )
 
 
