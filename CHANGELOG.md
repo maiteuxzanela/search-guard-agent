@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-27
+
+Patch release consolidando os refinamentos pós-auditoria Diana (Portão 2) e melhorias de portabilidade da matriz CI (TICKET-SGA-10).
+
+### Fixed
+- Eliminação de dupla execução do TreeSitterGuard no pipeline de verificação JS/TS.
+- Simetria estrita de inconclusive_reasons e veredito entre os ramos JS/TS e Python.
+- Validação de suíte Go exigindo ok_packages > 0 para evitar falso positivo.
+- Correção da contagem de total_files_scanned durante o fail-fast em Python.
+- Resiliência e integridade da execução no ambiente sem Tree-Sitter instalado.
+- Correção da detecção da bridge nativa de toolchains no macOS (macos-latest).
+
 ## [0.2.0] - 2026-10-22
 
 Major contract and execution-integrity upgrade (`TICKET-SGA-09`) plus the
@@ -167,7 +179,8 @@ MCP server, consolidating the former `cirurgic-search-mcp` and
 - Torch/Transformers dependencies and the obsolete `openjev_score_and_diagnose`
   tool from the ecosystem.
 
-[Unreleased]: https://github.com/maiteuxzanela/search-guard-agent/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/maiteuxzanela/search-guard-agent/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/maiteuxzanela/search-guard-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/maiteuxzanela/search-guard-agent/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/maiteuxzanela/search-guard-agent/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/maiteuxzanela/search-guard-agent/releases/tag/v0.1.0

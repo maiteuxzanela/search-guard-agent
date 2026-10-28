@@ -214,7 +214,7 @@ def test_package_json_identity_is_canonical():
     """``package.json`` publica ``search-guard-agent`` com bin e URLs canônicos."""
     manifest = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
     assert manifest["name"] == "search-guard-agent"
-    assert manifest["version"] == "0.2.0"
+    assert manifest["version"] == "0.2.1"
     assert manifest["repository"]["url"] == (
         f"git+{CANONICAL_REPO_URL}.git"
     )
@@ -243,6 +243,55 @@ def test_pyproject_identity_is_canonical():
         in scripts_block
     )
     assert 'agent-quality-guard = "agent_quality_guard.cli:main"' in scripts_block
+
+
+def _manifest_version() -> str:
+    """Versão canônica declarada no ``pyproject.toml`` real (sem mocks)."""
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'(?m)^version = "([^"]+)"$', pyproject)
+    assert match is not None, "version ausente no pyproject real"
+    return match.group(1)
+
+
+def _changelog_headings(changelog: str) -> list[str]:
+    return re.findall(r"(?m)^## \[([^\]]+)\]", changelog)
+
+
+def test_changelog_top_release_matches_manifest_version():
+    """O CHANGELOG promove exatamente a versão dos manifestos (lockstep)."""
+    version = _manifest_version()
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    headings = _changelog_headings(changelog)
+
+    assert headings[:1] == ["Unreleased"], headings[:3]
+    released = [heading for heading in headings if heading != "Unreleased"]
+    assert released[:1] == [version], (version, released[:3])
+    assert released.count(version) == 1, released
+    # Keep a Changelog: a seção liberada carrega a data ISO no heading.
+    assert re.search(
+        rf"(?m)^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$", changelog
+    ), f"heading de {version} sem data ISO"
+    # A seção Unreleased fica acima da versão corrente e não publica conteúdo.
+    unreleased_body = changelog.split("## [Unreleased]", 1)[1].split(
+        f"## [{version}]", 1
+    )[0]
+    assert unreleased_body.strip() == "", "Unreleased deve estar vazio no release"
+
+
+def test_changelog_link_refs_track_current_release():
+    """Comparações do rodapé apontam para a versão corrente e a anterior."""
+    version = _manifest_version()
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    released = [
+        heading for heading in _changelog_headings(changelog) if heading != "Unreleased"
+    ]
+    refs = dict(re.findall(r"(?m)^\[([^\]]+)\]: (\S+)$", changelog))
+
+    assert set(released) <= set(refs), sorted(set(released) - set(refs))
+    assert refs["Unreleased"].endswith(f"/compare/v{version}...HEAD"), refs["Unreleased"]
+    previous = released[1]
+    assert refs[version].endswith(f"/compare/v{previous}...v{version}"), refs[version]
+    assert previous in refs, f"versão anterior {previous} sem link de comparação"
 
 
 @pytest.mark.parametrize("doc", ["README.md", "SECURITY.md", "CONTRIBUTING.md"])
